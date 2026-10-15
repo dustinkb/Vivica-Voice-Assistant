@@ -1,0 +1,24 @@
+html, body {
+  background: radial-gradient(circle, #222244 0%, black 80%);
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  color: white;
+  height: 100vh;
+  width: 100vw;
+  position: fixed;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+gdm-live-audio {
+  display: block;
+  width: 100vw;
+  height: 100vh;
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}

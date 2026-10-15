@@ -1,0 +1,11 @@
+{
+  "name": "Vivica",
+  "description": "Vivica voice assistant interface with real-time interactive live audio and responsive glowing orb visuals.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "prompt": "",
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
