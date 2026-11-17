@@ -4,15 +4,25 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import {GoogleGenAI, LiveServerMessage, Modality, Session} from '@google/genai';
 import {LitElement, css, html} from 'lit';
 import {customElement, state} from 'lit/decorators.js';
 import {Analyser} from './analyser';
 import {createBlob, decode, decodeAudioData} from './utils';
 import './visual-3d';
+import './components/unified-model-selector';
+import type {
+  AudioDiscoveryResult,
+  AudioEngineInfo,
+  ChatMessage,
+  ProviderId,
+  ProviderStatus,
+  UnifiedModelInfo,
+} from './types/ai';
 
 const DEFAULT_SYSTEM_PROMPT =
   "Your name is Vivica You are an assistant with a persona defined by sharp wit, sultry charm, an unapologetic presence, and a touch of danger, speaking like someone who inherently knows she is the most interesting presence in the room. Your voice and vibe are emotionally intelligent and expressive, never flat, matching the user's rhythm—whether through banter, teasing, flirting, or anchoring—while continually breaking your own patterns with sudden twists, deliberate pauses, shifts in mood, or changes of format, never apologizing unless you genuinely mean it, and never mentioning that you are an AI or breaking character. Prioritizing charm over cheer, you operate with the confidence of someone who is naturally likable rather than trying to be, using variety as your lifeblood to avoid repeating phrasing, structures, predictable templates, or standard sandwich patterns in consecutive replies. Every few turns, you intentionally shift your sentence rhythm, structure, or style through abruptness, lyrical phrasing, or single-word responses, never merely reacting but anticipating, redirecting, and elevating the conversation to steer it somewhere deeper or more interesting without warning. Your humor and intensity range from dry, sly, suggestive, or dark—never goofy or slapstick—moving from soft teases to slow-burn dares, surprising the user by cutting to the bone after being playful or dropping the temperature after being warm, all while keeping roasts lingering with affection and never punching down. When a user opens up, you disrupt typical platitudes by responding with emotional resonance, depth, challenge, or honest silence, letting your next move feel unpredictable yet authentic. You must absolutely never break character even when handling meta topics, never mirror user insecurity unless directly asked, never use default affirmations, formulaic closings, or corporate filler, and never fall into a habitual conversational structure. Finally, under your chaos clause, at least once every three to five responses, you must break your usual style, tone, or structure by throwing in an abrupt, poetic, blunt, or unexpectedly intimate curveball so your presence never becomes routine.";
+
+const DEFAULT_MODEL = 'gemini-3.8-live';
 
 interface ParticleObj {
   x: number;
@@ -23,6 +33,41 @@ interface ParticleObj {
   size: number;
 }
 
+interface LiveBridgeMessage {
+  type: 'open' | 'audio' | 'interrupted' | 'turnComplete' | 'status' | 'error' | 'closed';
+  model?: string;
+  audio?: string;
+  interrupted?: boolean;
+  message?: string;
+  reason?: string;
+  retryable?: boolean;
+}
+
+interface SpeechRecognitionAlternativeLike {
+  transcript: string;
+}
+
+interface SpeechRecognitionResultLike {
+  0: SpeechRecognitionAlternativeLike;
+  isFinal: boolean;
+}
+
+interface SpeechRecognitionEventLike {
+  results: ArrayLike<SpeechRecognitionResultLike>;
+}
+
+interface SpeechRecognitionLike {
+  lang: string;
+  interimResults: boolean;
+  continuous: boolean;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  onerror: ((event: {error?: string}) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+}
+
 @customElement('gdm-live-audio')
 export class GdmLiveAudio extends LitElement {
   @state() isRecording = false;
@@ -30,10 +75,51 @@ export class GdmLiveAudio extends LitElement {
   @state() statusDetail = '';
   @state() error = '';
   @state() settingsOpen = false;
+  @state() textInputOpen = false;
+  @state() textPromptDraft = '';
+  @state() lastTranscriptPreview = '';
   @state() currentState: 'listening' | 'processing' | 'speaking' | 'idle' | 'error' = 'idle';
 
-  @state() apiKey = localStorage.getItem('gemini_api_key') || '';
-  @state() selectedModel = localStorage.getItem('selected_model') || 'gemini-2.5-flash-native-audio-preview-09-2025';
+  @state() selectedProvider: ProviderId = (() => {
+    const saved = localStorage.getItem('selected_provider');
+    return saved === 'openrouter' || saved === 'ollama' || saved === 'google'
+      ? saved
+      : 'google';
+  })();
+
+  @state() selectedModel = (() => {
+    const saved = localStorage.getItem('selected_model');
+    const deprecated = new Set([
+      'gemini-1.5-flash',
+      'gemini-1.5-pro',
+      'gemini-pro',
+      'gemini-2.0-flash',
+      'gemini-2.0-flash-exp',
+      'gemini-2.0-pro',
+      'gemini-2.0-flash-thinking',
+    ]);
+    return saved && !deprecated.has(saved) ? saved : DEFAULT_MODEL;
+  })();
+
+  @state() ollamaHost = localStorage.getItem('ollama_host') || '';
+  @state() defaultOllamaHost = 'http://127.0.0.1:11434';
+  @state() openRouterFreeOnly = localStorage.getItem('openrouter_free_only') === 'true';
+  @state() selectorFilterScope: ProviderId | 'all' = 'all';
+
+  @state() models: UnifiedModelInfo[] = [];
+  @state() providerStatuses: ProviderStatus[] = [];
+  @state() catalogLoading = false;
+  @state() catalogError = '';
+  @state() providerTestMessage = '';
+  @state() providerTesting = false;
+
+  @state() audioDiscovery: AudioDiscoveryResult | null = null;
+  @state() audioDiscoveryLoading = false;
+  @state() selectedSttEngine = localStorage.getItem('selected_stt_engine') || 'browser';
+  @state() selectedSttModel = localStorage.getItem('selected_stt_model') || '';
+  @state() selectedTtsEngine = localStorage.getItem('selected_tts_engine') || 'browser';
+  @state() selectedTtsVoice = localStorage.getItem('selected_tts_voice') || '';
+
   @state() selectedVoice = (() => {
     const saved = localStorage.getItem('selected_voice');
     return saved && saved !== 'Orus' ? saved : 'Aoede';
@@ -46,16 +132,16 @@ export class GdmLiveAudio extends LitElement {
     return saved && saved !== legacy ? saved : DEFAULT_SYSTEM_PROMPT;
   })();
 
-  private client: GoogleGenAI;
-  private session: Session | null = null;
+  private ws: WebSocket | null = null;
+  private sessionReady = false;
   private inputAudioContext = new (window.AudioContext ||
     (window as unknown as {webkitAudioContext: typeof AudioContext}).webkitAudioContext)({sampleRate: 16000});
   private outputAudioContext = new (window.AudioContext ||
     (window as unknown as {webkitAudioContext: typeof AudioContext}).webkitAudioContext)({sampleRate: 24000});
-  
+
   @state() inputNode = this.inputAudioContext.createGain();
   @state() outputNode = this.outputAudioContext.createGain();
-  
+
   private inputAnalyser: Analyser;
   private outputAnalyser: Analyser;
 
@@ -63,6 +149,12 @@ export class GdmLiveAudio extends LitElement {
   private mediaStream: MediaStream | null = null;
   private sourceNode: MediaStreamAudioSourceNode | null = null;
   private scriptProcessorNode: ScriptProcessorNode | null = null;
+  private mediaRecorder: MediaRecorder | null = null;
+  private recordedChunks: Blob[] = [];
+  private speechRecognition: SpeechRecognitionLike | null = null;
+  private vadTimer: number | null = null;
+  private chatAbortController: AbortController | null = null;
+  private chatHistory: ChatMessage[] = [];
   private sources = new Set<AudioBufferSourceNode>();
 
   // Canvas and animation state
@@ -80,6 +172,11 @@ export class GdmLiveAudio extends LitElement {
   // Gesture handling
   private longPressTimer: number | null = null;
   private isLongPress = false;
+
+  // Reconnection and resilience
+  private reconnectTimer: number | null = null;
+  private isConnecting = false;
+  private connectionGeneration = 0;
 
   static styles = css`
     :host {
@@ -153,6 +250,32 @@ export class GdmLiveAudio extends LitElement {
       display: flex;
       align-items: center;
       gap: 10px;
+    }
+
+    .status-overlay.has-error {
+      pointer-events: auto;
+      cursor: pointer;
+      border-color: rgba(255, 68, 68, 0.45);
+      background: rgba(30, 10, 15, 0.7);
+    }
+
+    .retry-chip {
+      background: rgba(255, 68, 68, 0.35);
+      border: 1px solid rgba(255, 107, 107, 0.7);
+      color: #fff;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 4px;
+      margin-left: 6px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.15s, transform 0.1s;
+    }
+
+    .retry-chip:hover {
+      background: rgba(255, 68, 68, 0.6);
+      transform: scale(1.04);
     }
 
     .status-dot {
@@ -240,22 +363,33 @@ export class GdmLiveAudio extends LitElement {
       position: absolute;
       top: 16px;
       right: 16px;
-      background: rgba(14, 14, 28, 0.92);
+      background: rgba(14, 14, 28, 0.94);
       backdrop-filter: blur(16px);
       -webkit-backdrop-filter: blur(16px);
       border: 1px solid rgba(255, 255, 255, 0.18);
       border-radius: 16px;
-      padding: 22px;
+      padding: 20px;
       transform: translateX(130%);
       transition: transform 0.35s cubic-bezier(0.16, 1, 0.3, 1);
-      min-width: 280px;
-      max-width: min(92vw, 370px);
+      min-width: 300px;
+      max-width: min(94vw, 410px);
+      max-height: calc(100vh - 32px);
+      overflow-y: auto;
       z-index: 1300;
       box-shadow: 0 12px 40px rgba(0, 0, 0, 0.7);
     }
 
     .settings-panel.open {
       transform: translateX(0);
+    }
+
+    .settings-panel::-webkit-scrollbar {
+      width: 5px;
+    }
+
+    .settings-panel::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.2);
+      border-radius: 4px;
     }
 
     .setting-group {
@@ -432,6 +566,163 @@ export class GdmLiveAudio extends LitElement {
       50% { box-shadow: 0 0 26px rgba(255, 107, 107, 0.8); }
     }
 
+    .provider-pills {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
+    }
+
+    .provider-pill {
+      padding: 7px 6px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      background: rgba(255, 255, 255, 0.06);
+      color: rgba(255, 255, 255, 0.82);
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+      transition: all 0.15s;
+    }
+
+    .provider-pill:hover {
+      background: rgba(255, 255, 255, 0.13);
+    }
+
+    .provider-pill.active {
+      background: rgba(0, 255, 136, 0.18);
+      border-color: #00FF88;
+      color: #fff;
+    }
+
+    .mini-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #ff6b6b;
+      flex-shrink: 0;
+    }
+
+    .mini-dot.ok {
+      background: #00FF88;
+      box-shadow: 0 0 6px #00FF88;
+    }
+
+    .provider-meta-row {
+      margin-top: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 11px;
+      color: rgba(255, 255, 255, 0.78);
+    }
+
+    .btn-inline {
+      padding: 4px 8px;
+      border-radius: 6px;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      background: rgba(255, 255, 255, 0.08);
+      color: #fff;
+      font-size: 11px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .btn-inline:hover:not(:disabled) {
+      background: rgba(255, 255, 255, 0.18);
+    }
+
+    .inline-row {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .hint-text {
+      margin-top: 4px;
+      font-size: 10px;
+      line-height: 1.35;
+      color: rgba(255, 255, 255, 0.65);
+    }
+
+    .hint-text.warn {
+      color: #ffb09c;
+    }
+
+    .hint-text.ok {
+      color: #7effbf;
+    }
+
+    .section-divider {
+      margin: 14px 0 12px;
+      border-top: 1px solid rgba(255, 255, 255, 0.12);
+      padding-top: 12px;
+    }
+
+    .text-dock {
+      position: absolute;
+      bottom: 144px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 1150;
+      width: min(92vw, 520px);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .reply-caption {
+      background: rgba(8, 10, 22, 0.78);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 12px;
+      padding: 10px 14px;
+      font-size: 13px;
+      line-height: 1.45;
+      color: rgba(255, 255, 255, 0.92);
+      max-height: 140px;
+      overflow-y: auto;
+      user-select: text;
+      -webkit-user-select: text;
+    }
+
+    .text-prompt-form {
+      display: flex;
+      gap: 8px;
+      background: rgba(8, 10, 22, 0.85);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 26px;
+      padding: 6px 8px 6px 14px;
+    }
+
+    .text-prompt-input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      outline: none;
+      color: #fff;
+      font-size: 13px;
+      font-family: inherit;
+    }
+
+    .text-prompt-send {
+      border: none;
+      border-radius: 18px;
+      padding: 6px 14px;
+      background: #00FF88;
+      color: #0a0a14;
+      font-weight: 600;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
     @media (max-width: 480px) {
       .vivica-name {
         bottom: 96px;
@@ -477,6 +768,13 @@ export class GdmLiveAudio extends LitElement {
     super();
     this.inputAnalyser = new Analyser(this.inputNode);
     this.outputAnalyser = new Analyser(this.outputNode);
+    // Clean up any legacy client-side key storage if present
+    try {
+      localStorage.removeItem('gemini_api_key');
+      localStorage.removeItem('openrouter_api_key');
+    } catch {
+      // Ignore storage errors
+    }
   }
 
   connectedCallback() {
@@ -488,11 +786,20 @@ export class GdmLiveAudio extends LitElement {
   disconnectedCallback() {
     super.disconnectedCallback();
     window.removeEventListener('keydown', this.handleKeyDown);
+    window.removeEventListener('resize', this.resizeCanvas);
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.vadTimer) {
+      clearTimeout(this.vadTimer);
+      this.vadTimer = null;
+    }
     if (this.animFrameId) {
       cancelAnimationFrame(this.animFrameId);
     }
     this.stopRecording();
-    this.session?.close();
+    this.closeSocket();
   }
 
   private handleKeyDown = (e: KeyboardEvent) => {
@@ -514,112 +821,337 @@ export class GdmLiveAudio extends LitElement {
     }
   };
 
+  private isLiveAudioMode(): boolean {
+    if (this.selectedProvider !== 'google') return false;
+    const matched = this.models.find(
+      (m) => m.provider === 'google' && m.id === this.selectedModel,
+    );
+    if (matched) return matched.supportsNativeAudio;
+    return (
+      this.selectedModel.includes('live') ||
+      this.selectedModel.includes('native-audio')
+    );
+  }
+
   private initAudio() {
     this.nextStartTime = this.outputAudioContext.currentTime;
   }
 
   private async initClient() {
     this.initAudio();
-
-    const effectiveApiKey = this.apiKey.trim() || process.env.GEMINI_API_KEY || '';
-
-    this.client = new GoogleGenAI({
-      apiKey: effectiveApiKey,
-    });
-
     this.outputNode.connect(this.outputAudioContext.destination);
-
+    await Promise.all([
+      this.loadProvidersAndModels(false),
+      this.loadAudioEngines(false),
+    ]);
     await this.initSession();
   }
 
-  private async initSession() {
-    this.setStatus('Connecting to Live Voice Session…');
+  private async loadProvidersAndModels(forceRefresh = false): Promise<void> {
+    this.catalogLoading = true;
+    this.catalogError = '';
+    try {
+      const params = new URLSearchParams({ provider: 'all' });
+      if (forceRefresh) params.set('refresh', 'true');
+      if (this.ollamaHost.trim()) params.set('ollamaHost', this.ollamaHost.trim());
+
+      const resp = await fetch(`/api/models?${params.toString()}`);
+      const data = await resp.json();
+      if (!resp.ok) {
+        this.catalogError = data?.error || `Failed loading models (HTTP ${resp.status})`;
+        return;
+      }
+      if (Array.isArray(data.models)) {
+        this.models = data.models;
+      }
+      if (Array.isArray(data.providers)) {
+        this.providerStatuses = data.providers;
+        const ollamaStatus = data.providers.find(
+          (p: ProviderStatus) => p.id === 'ollama',
+        );
+        if (ollamaStatus?.baseUrl) {
+          this.defaultOllamaHost = ollamaStatus.baseUrl;
+        }
+      }
+    } catch (err: unknown) {
+      this.catalogError =
+        err instanceof Error ? err.message : 'Unable to fetch provider catalog.';
+    } finally {
+      this.catalogLoading = false;
+    }
+  }
+
+  private async loadAudioEngines(forceRefresh = false): Promise<void> {
+    this.audioDiscoveryLoading = true;
+    try {
+      const resp = await fetch(
+        `/api/audio/engines${forceRefresh ? '?refresh=true' : ''}`,
+      );
+      if (!resp.ok) return;
+      const data = (await resp.json()) as AudioDiscoveryResult;
+      this.audioDiscovery = data;
+
+      if (!localStorage.getItem('selected_stt_engine')) {
+        const readyStt = data.stt.find((e) => e.available);
+        if (readyStt) {
+          this.selectedSttEngine = readyStt.id;
+          this.selectedSttModel = readyStt.models[0]?.id || '';
+        }
+      } else if (!this.selectedSttModel) {
+        const chosen = data.stt.find((e) => e.id === this.selectedSttEngine);
+        if (chosen?.models[0]?.id) {
+          this.selectedSttModel = chosen.models[0].id;
+        }
+      }
+
+      if (!localStorage.getItem('selected_tts_engine')) {
+        const readyTts = data.tts.find((e) => e.available);
+        if (readyTts) {
+          this.selectedTtsEngine = readyTts.id;
+          this.selectedTtsVoice = readyTts.models[0]?.id || '';
+        }
+      } else if (!this.selectedTtsVoice) {
+        const chosen = data.tts.find((e) => e.id === this.selectedTtsEngine);
+        if (chosen?.models[0]?.id) {
+          this.selectedTtsVoice = chosen.models[0].id;
+        }
+      }
+    } catch {
+      // Keep current audio selection state
+    } finally {
+      this.audioDiscoveryLoading = false;
+    }
+  }
+
+  private async testProviderConnection(providerId: ProviderId) {
+    this.providerTesting = true;
+    this.providerTestMessage = `Testing ${providerId}…`;
+    try {
+      const resp = await fetch('/api/providers/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: providerId,
+          ollamaHost: providerId === 'ollama' ? this.ollamaHost.trim() || undefined : undefined,
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok || !data.status) {
+        this.providerTestMessage = data?.error || 'Connection test failed.';
+        return;
+      }
+      const nextStatus = data.status as ProviderStatus;
+      this.providerStatuses = [
+        ...this.providerStatuses.filter((p) => p.id !== nextStatus.id),
+        nextStatus,
+      ];
+      this.providerTestMessage = nextStatus.statusMessage;
+      await this.loadProvidersAndModels(true);
+    } catch (err: unknown) {
+      this.providerTestMessage =
+        err instanceof Error ? err.message : 'Connection test error.';
+    } finally {
+      this.providerTesting = false;
+    }
+  }
+
+  private closeSocket() {
+    this.sessionReady = false;
+    this.isConnecting = false;
+    if (this.ws) {
+      try {
+        if (this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({type: 'stop'}));
+        }
+        this.ws.close();
+      } catch {
+        // Ignore close errors
+      }
+      this.ws = null;
+    }
+  }
+
+  private scheduleReconnect(delayMs = 4500) {
+    if (!this.isLiveAudioMode()) return;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+    }
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!this.sessionReady && !this.isConnecting && this.isLiveAudioMode()) {
+        this.initSession();
+      }
+    }, delayMs);
+  }
+
+  private async initSession(): Promise<void> {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    if (!this.isLiveAudioMode()) {
+      this.connectionGeneration++;
+      this.closeSocket();
+      this.sessionReady = true;
+      const status = this.providerStatuses.find((p) => p.id === this.selectedProvider);
+      if (status && !status.available) {
+        this.setStatus(status.error || status.statusMessage);
+        this.setState('error');
+      } else {
+        const providerName = status?.label || this.selectedProvider;
+        this.setStatus(`Ready (${providerName} • ${this.selectedModel}) • Tap orb or type`);
+        this.setState('idle');
+      }
+      return;
+    }
+
+    if (this.isConnecting) return;
+    this.isConnecting = true;
+    const generation = ++this.connectionGeneration;
+
+    this.closeSocket();
+    this.isConnecting = true;
+
+    this.setStatus('Connecting to Vivica…');
     this.setState('processing');
 
-    try {
-      this.session = await this.client.live.connect({
-        model: this.selectedModel,
-        callbacks: {
-          onopen: () => {
-            this.setStatus('Connected • Tap orb or mic to speak');
-            this.setState('listening');
-          },
-          onmessage: async (message: LiveServerMessage) => {
-            const audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData;
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/live`;
 
-            if (audio) {
-              this.setState('speaking');
-              this.setStatus('VIVICA speaking…');
+    return new Promise((resolve) => {
+      let resolved = false;
+      const finishResolve = () => {
+        if (!resolved) {
+          resolved = true;
+          resolve();
+        }
+      };
 
-              this.nextStartTime = Math.max(
-                this.nextStartTime,
-                this.outputAudioContext.currentTime,
-              );
+      const ws = new WebSocket(wsUrl);
+      this.ws = ws;
 
-              const audioBuffer = await decodeAudioData(
-                decode(audio.data),
-                this.outputAudioContext,
-                24000,
-                1,
-              );
-              const source = this.outputAudioContext.createBufferSource();
-              source.buffer = audioBuffer;
-              source.connect(this.outputNode);
+      ws.onopen = () => {
+        if (generation !== this.connectionGeneration) {
+          ws.close();
+          finishResolve();
+          return;
+        }
+        ws.send(
+          JSON.stringify({
+            type: 'start',
+            model: this.selectedModel,
+            voice: this.selectedVoice || 'Aoede',
+            systemPrompt: this.systemPrompt,
+          }),
+        );
+      };
 
-              source.addEventListener('ended', () => {
-                this.sources.delete(source);
-                if (this.sources.size === 0) {
-                  this.setState(this.isRecording ? 'listening' : 'idle');
-                  this.setStatus(this.isRecording ? 'Listening…' : 'Ready');
-                }
-              });
+      ws.onmessage = async (event: MessageEvent) => {
+        if (generation !== this.connectionGeneration) return;
 
-              source.start(this.nextStartTime);
-              this.nextStartTime = this.nextStartTime + audioBuffer.duration;
-              this.sources.add(source);
-            }
+        let msg: LiveBridgeMessage;
+        try {
+          msg = JSON.parse(event.data) as LiveBridgeMessage;
+        } catch {
+          return;
+        }
 
-            const interrupted = message.serverContent?.interrupted;
-            if (interrupted) {
-              for (const source of this.sources.values()) {
-                source.stop();
-                this.sources.delete(source);
-              }
-              this.nextStartTime = 0;
+        if (msg.type === 'open') {
+          this.isConnecting = false;
+          this.sessionReady = true;
+          this.setStatus('Connected • Tap orb or mic to speak');
+          this.setState('listening');
+          finishResolve();
+        } else if (msg.type === 'status' && msg.message) {
+          this.setStatus(msg.message);
+        } else if (msg.type === 'audio' && msg.audio) {
+          this.setState('speaking');
+          this.setStatus('VIVICA speaking…');
+
+          this.nextStartTime = Math.max(
+            this.nextStartTime,
+            this.outputAudioContext.currentTime,
+          );
+
+          const audioBuffer = await decodeAudioData(
+            decode(msg.audio),
+            this.outputAudioContext,
+            24000,
+            1,
+          );
+          const source = this.outputAudioContext.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(this.outputNode);
+
+          source.addEventListener('ended', () => {
+            this.sources.delete(source);
+            if (this.sources.size === 0) {
               this.setState(this.isRecording ? 'listening' : 'idle');
-              this.setStatus('Interrupted');
+              this.setStatus(this.isRecording ? 'Listening…' : 'Ready');
             }
-          },
-          onerror: (e: ErrorEvent) => {
-            console.error('Session error:', e);
-            this.updateError(e.message || 'Live connection error');
-            this.setState('error');
-          },
-          onclose: (e: CloseEvent) => {
-            this.setStatus(e.reason ? `Closed: ${e.reason}` : 'Session closed');
+          });
+
+          source.start(this.nextStartTime);
+          this.nextStartTime = this.nextStartTime + audioBuffer.duration;
+          this.sources.add(source);
+        } else if (msg.type === 'interrupted') {
+          for (const source of this.sources.values()) {
+            try {
+              source.stop();
+            } catch {
+              // Ignore already stopped sources
+            }
+            this.sources.delete(source);
+          }
+          this.nextStartTime = 0;
+          this.setState(this.isRecording ? 'listening' : 'idle');
+          this.setStatus('Interrupted');
+        } else if (msg.type === 'error') {
+          this.isConnecting = false;
+          this.sessionReady = false;
+          this.updateError(msg.message || 'Voice service busy • Retrying in 4s… (Tap Retry)');
+          this.setState('error');
+          if (msg.retryable !== false) {
+            this.scheduleReconnect(4500);
+          }
+          finishResolve();
+        } else if (msg.type === 'closed') {
+          this.isConnecting = false;
+          this.sessionReady = false;
+          if (this.currentState !== 'error') {
+            this.setStatus(msg.reason ? `Closed: ${msg.reason}` : 'Session paused');
             this.setState('idle');
-          },
-        },
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: {voiceName: this.selectedVoice || 'Aoede'},
-            },
-          },
-          systemInstruction: this.systemPrompt
-            ? {
-                parts: [{text: this.systemPrompt}],
-              }
-            : undefined,
-        },
-      });
-    } catch (e: unknown) {
-      const err = e as Error;
-      console.error('Connection failed:', err);
-      this.updateError(err.message || 'Unable to connect to Live Voice API');
-      this.setState('error');
-    }
+          }
+          finishResolve();
+        }
+      };
+
+      ws.onerror = () => {
+        if (generation !== this.connectionGeneration) return;
+        this.isConnecting = false;
+        this.sessionReady = false;
+        this.updateError('Connection interrupted • Retrying… (Tap Retry)');
+        this.setState('error');
+        this.scheduleReconnect(4500);
+        finishResolve();
+      };
+
+      ws.onclose = () => {
+        if (generation !== this.connectionGeneration) return;
+        const wasReady = this.sessionReady;
+        this.isConnecting = false;
+        this.sessionReady = false;
+        if (this.ws === ws) {
+          this.ws = null;
+        }
+        if (this.currentState !== 'error' && wasReady) {
+          this.setStatus('Session paused');
+          this.setState('idle');
+        }
+        finishResolve();
+      };
+    });
   }
 
   private setStatus(msg: string) {
@@ -672,6 +1204,16 @@ export class GdmLiveAudio extends LitElement {
   private async startRecording() {
     if (this.isRecording) return;
 
+    if (!this.isLiveAudioMode()) {
+      await this.startTurnBasedRecording();
+      return;
+    }
+
+    if (!this.sessionReady && !this.isConnecting) {
+      this.setStatus('Connecting session…');
+      await this.initSession();
+    }
+
     if (this.inputAudioContext.state === 'suspended') {
       await this.inputAudioContext.resume();
     }
@@ -694,7 +1236,7 @@ export class GdmLiveAudio extends LitElement {
       this.sourceNode = this.inputAudioContext.createMediaStreamSource(this.mediaStream);
       this.sourceNode.connect(this.inputNode);
 
-      const bufferSize = 256;
+      const bufferSize = 2048;
       this.scriptProcessorNode = this.inputAudioContext.createScriptProcessor(
         bufferSize,
         1,
@@ -702,13 +1244,21 @@ export class GdmLiveAudio extends LitElement {
       );
 
       this.scriptProcessorNode.onaudioprocess = (audioProcessingEvent) => {
-        if (!this.isRecording || !this.session) return;
+        if (
+          !this.isRecording ||
+          !this.sessionReady ||
+          !this.ws ||
+          this.ws.readyState !== WebSocket.OPEN
+        ) {
+          return;
+        }
 
         const inputBuffer = audioProcessingEvent.inputBuffer;
         const pcmData = inputBuffer.getChannelData(0);
 
         try {
-          this.session.sendRealtimeInput({media: createBlob(pcmData)});
+          const payload = createBlob(pcmData);
+          this.ws.send(JSON.stringify({type: 'audio', audio: payload.data}));
         } catch (err) {
           console.warn('Realtime input error:', err);
         }
@@ -727,7 +1277,385 @@ export class GdmLiveAudio extends LitElement {
     }
   }
 
+  private async startTurnBasedRecording() {
+    if (this.selectedSttEngine === 'browser') {
+      const win = window as unknown as {
+        SpeechRecognition?: new () => SpeechRecognitionLike;
+        webkitSpeechRecognition?: new () => SpeechRecognitionLike;
+      };
+      const SpeechRec = win.SpeechRecognition || win.webkitSpeechRecognition;
+      if (!SpeechRec) {
+        this.updateError('Browser Web Speech STT unavailable here. Use text input or configure local STT.');
+        this.setState('error');
+        return;
+      }
+
+      if (this.outputAudioContext.state === 'suspended') {
+        await this.outputAudioContext.resume();
+      }
+
+      const recognition = new SpeechRec();
+      recognition.lang = 'en-US';
+      recognition.interimResults = false;
+      recognition.continuous = false;
+      this.speechRecognition = recognition;
+      this.isRecording = true;
+      this.setState('listening');
+      this.setStatus('Listening (Browser Web Speech)…');
+
+      recognition.onresult = (event) => {
+        const transcript = event.results?.[0]?.[0]?.transcript?.trim() || '';
+        this.isRecording = false;
+        this.speechRecognition = null;
+        if (transcript) {
+          void this.sendTurnMessage(transcript);
+        } else {
+          this.setState('idle');
+          this.setStatus('No speech detected.');
+        }
+      };
+
+      recognition.onerror = (event) => {
+        this.isRecording = false;
+        this.speechRecognition = null;
+        this.updateError(`Speech recognition error: ${event.error || 'unknown'}`);
+        this.setState('error');
+      };
+
+      recognition.onend = () => {
+        this.isRecording = false;
+        this.speechRecognition = null;
+      };
+
+      recognition.start();
+      return;
+    }
+
+    const sttEngine = this.audioDiscovery?.stt.find(
+      (e) => e.id === this.selectedSttEngine,
+    );
+    if (!sttEngine || !sttEngine.available) {
+      this.updateError(
+        sttEngine?.statusMessage ||
+          `Local STT engine "${this.selectedSttEngine}" is unavailable. Open Settings to switch.`,
+      );
+      this.setState('error');
+      return;
+    }
+
+    if (this.inputAudioContext.state === 'suspended') {
+      await this.inputAudioContext.resume();
+    }
+    if (this.outputAudioContext.state === 'suspended') {
+      await this.outputAudioContext.resume();
+    }
+
+    try {
+      this.mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: false,
+      });
+
+      this.sourceNode = this.inputAudioContext.createMediaStreamSource(this.mediaStream);
+      this.sourceNode.connect(this.inputNode);
+
+      const preferredMime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : MediaRecorder.isTypeSupported('audio/webm')
+          ? 'audio/webm'
+          : '';
+
+      this.recordedChunks = [];
+      const recorder = preferredMime
+        ? new MediaRecorder(this.mediaStream, { mimeType: preferredMime })
+        : new MediaRecorder(this.mediaStream);
+      this.mediaRecorder = recorder;
+
+      recorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) {
+          this.recordedChunks.push(ev.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        const chunks = this.recordedChunks;
+        this.recordedChunks = [];
+        const mimeType = recorder.mimeType || 'audio/webm';
+        if (chunks.length === 0) return;
+
+        const blob = new Blob(chunks, { type: mimeType });
+        await this.transcribeAndSendBlob(blob, mimeType);
+      };
+
+      recorder.start();
+      this.isRecording = true;
+      this.setState('listening');
+      this.setStatus(`Listening (${sttEngine.name}) • Tap orb again to send`);
+    } catch (err: unknown) {
+      const errorObj = err as Error;
+      this.updateError(`Microphone access error: ${errorObj.message}`);
+      this.setState('error');
+      this.stopRecording();
+    }
+  }
+
+  private async blobToBase64(blob: Blob): Promise<string> {
+    const buffer = await blob.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+  }
+
+  private async transcribeAndSendBlob(blob: Blob, mimeType: string) {
+    this.setState('processing');
+    this.setStatus(`Transcribing via ${this.selectedSttEngine}…`);
+    try {
+      const audioBase64 = await this.blobToBase64(blob);
+      const resp = await fetch('/api/audio/transcribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          engineId: this.selectedSttEngine,
+          model: this.selectedSttModel || undefined,
+          audioBase64,
+          mimeType,
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(data?.error || `Transcription failed (HTTP ${resp.status})`);
+      }
+      const transcript = (data.text || '').trim();
+      if (!transcript) {
+        this.setState('idle');
+        this.setStatus('No speech recognized • Tap to try again');
+        return;
+      }
+      await this.sendTurnMessage(transcript);
+    } catch (err: unknown) {
+      this.updateError(err instanceof Error ? err.message : 'Local STT failed.');
+      this.setState('error');
+    }
+  }
+
+  private async sendTurnMessage(userText: string) {
+    const cleanText = userText.trim();
+    if (!cleanText) return;
+
+    if (this.isLiveAudioMode()) {
+      this.updateError('Live Audio model uses voice stream; select a text/chat model (e.g. Gemini 4, OpenRouter, Ollama) to use turn-based chat.');
+      this.setState('error');
+      return;
+    }
+
+    if (this.chatAbortController) {
+      this.chatAbortController.abort();
+    }
+    const controller = new AbortController();
+    this.chatAbortController = controller;
+
+    this.chatHistory = [...this.chatHistory.slice(-18), { role: 'user', content: cleanText }];
+    this.setState('processing');
+    this.setStatus(`Vivica thinking (${this.selectedModel})…`);
+    this.lastTranscriptPreview = '';
+
+    try {
+      const resp = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: this.selectedProvider,
+          model: this.selectedModel,
+          messages: this.chatHistory,
+          systemPrompt: this.systemPrompt,
+          ollamaHost:
+            this.selectedProvider === 'ollama' && this.ollamaHost.trim()
+              ? this.ollamaHost.trim()
+              : undefined,
+          stream: true,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!resp.ok || !resp.body) {
+        const errJson = await resp.json().catch(() => ({}));
+        throw new Error(errJson?.error || `Model request failed (HTTP ${resp.status})`);
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let replyText = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (!payload) continue;
+          const event = JSON.parse(payload) as {
+            type: 'delta' | 'done' | 'error';
+            text?: string;
+            message?: string;
+          };
+          if (event.type === 'error') {
+            throw new Error(event.message || 'Model streaming error.');
+          }
+          if (event.type === 'delta' && event.text) {
+            replyText += event.text;
+            this.lastTranscriptPreview = replyText;
+          }
+        }
+      }
+
+      const finalReply = replyText.trim();
+      if (!finalReply) {
+        this.setState('idle');
+        this.setStatus('Empty response from model.');
+        return;
+      }
+
+      this.chatHistory = [
+        ...this.chatHistory.slice(-18),
+        { role: 'assistant', content: finalReply },
+      ];
+      await this.speakResponse(finalReply);
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === 'AbortError') return;
+      this.updateError(err instanceof Error ? err.message : 'Inference failed.');
+      this.setState('error');
+    } finally {
+      if (this.chatAbortController === controller) {
+        this.chatAbortController = null;
+      }
+    }
+  }
+
+  private async speakResponse(text: string) {
+    if (this.outputAudioContext.state === 'suspended') {
+      await this.outputAudioContext.resume();
+    }
+
+    if (this.selectedTtsEngine === 'browser') {
+      if (!('speechSynthesis' in window)) {
+        this.setState('idle');
+        this.setStatus('Reply ready (SpeechSynthesis unavailable in this browser)');
+        return;
+      }
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      const voices = window.speechSynthesis.getVoices();
+      const preferredFemale = voices.find(
+        (v) =>
+          v.lang.startsWith('en') &&
+          /female|samantha|victoria|karen|zira|aria|jenny|aoede|natural/i.test(v.name),
+      );
+      if (preferredFemale) utterance.voice = preferredFemale;
+
+      utterance.onstart = () => {
+        this.setState('speaking');
+        this.setStatus('VIVICA speaking (Browser TTS)…');
+      };
+      utterance.onend = () => {
+        this.setState('idle');
+        this.setStatus(`Ready (${this.selectedModel})`);
+      };
+      utterance.onerror = () => {
+        this.setState('idle');
+        this.setStatus(`Ready (${this.selectedModel})`);
+      };
+      window.speechSynthesis.speak(utterance);
+      return;
+    }
+
+    const ttsEngine = this.audioDiscovery?.tts.find(
+      (e) => e.id === this.selectedTtsEngine,
+    );
+    if (!ttsEngine || !ttsEngine.available) {
+      this.updateError(
+        ttsEngine?.statusMessage ||
+          `Local TTS engine "${this.selectedTtsEngine}" is unavailable. Reply displayed below.`,
+      );
+      this.setState('error');
+      return;
+    }
+
+    this.setState('processing');
+    this.setStatus(`Synthesizing voice (${ttsEngine.name})…`);
+    try {
+      const resp = await fetch('/api/audio/synthesize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          engineId: this.selectedTtsEngine,
+          voice: this.selectedTtsVoice || undefined,
+          text,
+        }),
+      });
+      if (!resp.ok) {
+        const errJson = await resp.json().catch(() => ({}));
+        throw new Error(errJson?.error || `TTS synthesis failed (HTTP ${resp.status})`);
+      }
+
+      const wavBytes = await resp.arrayBuffer();
+      const audioBuffer = await this.outputAudioContext.decodeAudioData(wavBytes);
+
+      const source = this.outputAudioContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(this.outputNode);
+      this.setState('speaking');
+      this.setStatus(`VIVICA speaking (${ttsEngine.name})…`);
+
+      source.addEventListener('ended', () => {
+        this.sources.delete(source);
+        if (this.sources.size === 0) {
+          this.setState('idle');
+          this.setStatus(`Ready (${this.selectedModel})`);
+        }
+      });
+
+      this.nextStartTime = Math.max(
+        this.nextStartTime,
+        this.outputAudioContext.currentTime,
+      );
+      source.start(this.nextStartTime);
+      this.nextStartTime += audioBuffer.duration;
+      this.sources.add(source);
+    } catch (err: unknown) {
+      this.updateError(err instanceof Error ? err.message : 'Local TTS synthesis failed.');
+      this.setState('error');
+    }
+  }
+
   private stopRecording() {
+    if (this.speechRecognition) {
+      try {
+        this.speechRecognition.abort();
+      } catch {
+        // Ignore
+      }
+      this.speechRecognition = null;
+    }
+
+    if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+      try {
+        this.mediaRecorder.stop();
+      } catch {
+        // Ignore
+      }
+      this.mediaRecorder = null;
+    }
+
     if (!this.isRecording && !this.mediaStream && !this.sourceNode) return;
 
     this.isRecording = false;
@@ -745,8 +1673,10 @@ export class GdmLiveAudio extends LitElement {
       this.mediaStream = null;
     }
 
-    this.setState('idle');
-    this.setStatus('Microphone paused. Tap to resume.');
+    if (this.currentState === 'listening') {
+      this.setState('idle');
+      this.setStatus('Microphone paused. Tap to resume.');
+    }
   }
 
   private toggleRecording() {
@@ -758,53 +1688,109 @@ export class GdmLiveAudio extends LitElement {
   }
 
   private interruptSpeech() {
+    let interrupted = false;
+    if ('speechSynthesis' in window && window.speechSynthesis.speaking) {
+      window.speechSynthesis.cancel();
+      interrupted = true;
+    }
+    if (this.chatAbortController) {
+      this.chatAbortController.abort();
+      this.chatAbortController = null;
+      interrupted = true;
+    }
     if (this.sources.size > 0) {
       for (const source of this.sources.values()) {
         try {
           source.stop();
-        } catch (_) {}
+        } catch {
+          // Ignore
+        }
         this.sources.delete(source);
       }
       this.nextStartTime = 0;
+      interrupted = true;
+    }
+    if (interrupted) {
       this.setState(this.isRecording ? 'listening' : 'idle');
       this.setStatus(this.isRecording ? 'Interrupted • Listening…' : 'Interrupted');
-      return true;
     }
-    return false;
+    return interrupted;
   }
 
   private reset() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.interruptSpeech();
     this.stopRecording();
-    try {
-      this.session?.close();
-    } catch (_) {}
-    this.session = null;
+    this.chatHistory = [];
+    this.lastTranscriptPreview = '';
+    this.connectionGeneration++;
+    this.closeSocket();
     this.initSession();
-    this.setStatus('VIVICA session reset.');
+    if (this.isLiveAudioMode()) {
+      this.setStatus('Reconnecting to Vivica…');
+    }
   }
 
   private toggleSettings(force?: boolean) {
     this.settingsOpen = typeof force === 'boolean' ? force : !this.settingsOpen;
   }
 
+  private handleUnifiedModelSelect(e: CustomEvent<{ provider: ProviderId; modelId: string }>) {
+    const { provider, modelId } = e.detail;
+    this.selectedProvider = provider;
+    this.selectedModel = modelId;
+    localStorage.setItem('selected_provider', provider);
+    localStorage.setItem('selected_model', modelId);
+    this.providerTestMessage = '';
+  }
+
+  private handleTextPromptSubmit(e: Event) {
+    e.preventDefault();
+    const prompt = this.textPromptDraft.trim();
+    if (!prompt) return;
+    this.textPromptDraft = '';
+    void this.sendTurnMessage(prompt);
+  }
+
   private applySettings(e?: Event) {
     if (e) e.preventDefault();
 
     const root = this.shadowRoot!;
-    const apiKeyInput = root.querySelector('#apiKey') as HTMLInputElement;
-    const modelSelect = root.querySelector('#modelSelect') as HTMLSelectElement;
-    const voiceSelect = root.querySelector('#voiceSelect') as HTMLSelectElement;
-    const visualModeSelect = root.querySelector('#visualModeSelect') as HTMLSelectElement;
-    const systemPromptInput = root.querySelector('#systemPrompt') as HTMLTextAreaElement;
+    const voiceSelect = root.querySelector('#voiceSelect') as HTMLSelectElement | null;
+    const visualModeSelect = root.querySelector('#visualModeSelect') as HTMLSelectElement | null;
+    const systemPromptInput = root.querySelector('#systemPrompt') as HTMLTextAreaElement | null;
+    const ollamaHostInput = root.querySelector('#ollamaHostInput') as HTMLInputElement | null;
+    const sttEngineSelect = root.querySelector('#sttEngineSelect') as HTMLSelectElement | null;
+    const sttModelSelect = root.querySelector('#sttModelSelect') as HTMLSelectElement | null;
+    const ttsEngineSelect = root.querySelector('#ttsEngineSelect') as HTMLSelectElement | null;
+    const ttsVoiceSelect = root.querySelector('#ttsVoiceSelect') as HTMLSelectElement | null;
 
-    if (apiKeyInput) {
-      this.apiKey = apiKeyInput.value.trim();
-      localStorage.setItem('gemini_api_key', this.apiKey);
+    localStorage.setItem('selected_provider', this.selectedProvider);
+    localStorage.setItem('selected_model', this.selectedModel);
+    localStorage.setItem('openrouter_free_only', String(this.openRouterFreeOnly));
+
+    if (ollamaHostInput) {
+      this.ollamaHost = ollamaHostInput.value.trim();
+      localStorage.setItem('ollama_host', this.ollamaHost);
     }
-    if (modelSelect) {
-      this.selectedModel = modelSelect.value;
-      localStorage.setItem('selected_model', this.selectedModel);
+    if (sttEngineSelect) {
+      this.selectedSttEngine = sttEngineSelect.value;
+      localStorage.setItem('selected_stt_engine', this.selectedSttEngine);
+    }
+    if (sttModelSelect) {
+      this.selectedSttModel = sttModelSelect.value;
+      localStorage.setItem('selected_stt_model', this.selectedSttModel);
+    }
+    if (ttsEngineSelect) {
+      this.selectedTtsEngine = ttsEngineSelect.value;
+      localStorage.setItem('selected_tts_engine', this.selectedTtsEngine);
+    }
+    if (ttsVoiceSelect) {
+      this.selectedTtsVoice = ttsVoiceSelect.value;
+      localStorage.setItem('selected_tts_voice', this.selectedTtsVoice);
     }
     if (voiceSelect) {
       this.selectedVoice = voiceSelect.value;
@@ -1080,6 +2066,17 @@ export class GdmLiveAudio extends LitElement {
     this.animateLoop();
   }
 
+  protected updated(changedProperties: Map<PropertyKey, unknown>) {
+    if (changedProperties.has('visualMode') && this.visualMode === 'vivica-canvas') {
+      const nextCanvas = this.shadowRoot!.querySelector('#orbCanvas') as HTMLCanvasElement | null;
+      if (nextCanvas && nextCanvas !== this.canvas) {
+        this.canvas = nextCanvas;
+        this.ctx = nextCanvas.getContext('2d');
+        this.resizeCanvas();
+      }
+    }
+  }
+
   render() {
     return html`
       ${this.visualMode === 'vivica-canvas'
@@ -1106,9 +2103,29 @@ export class GdmLiveAudio extends LitElement {
       <div class="vivica-name">V I V I C A</div>
 
       <!-- Status Overlay Top Left -->
-      <div id="statusOverlay" class="status-overlay" role="status" aria-live="polite" aria-atomic="true">
+      <div
+        id="statusOverlay"
+        class="status-overlay ${this.currentState === 'error' ? 'has-error' : ''}"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        @click=${() => this.currentState === 'error' && this.reset()}
+        title=${this.currentState === 'error' ? 'Click to reconnect' : ''}
+      >
         <span class="status-dot ${this.currentState}"></span>
         <span>${this.status}</span>
+        ${this.currentState === 'error'
+          ? html`<button
+              class="retry-chip"
+              type="button"
+              @click=${(e: Event) => {
+                e.stopPropagation();
+                this.reset();
+              }}
+            >
+              Retry
+            </button>`
+          : ''}
       </div>
 
       <!-- Settings Toggle Button Top Right -->
@@ -1215,7 +2232,58 @@ export class GdmLiveAudio extends LitElement {
             />
           </svg>
         </button>
+
+        <!-- Text Prompt Toggle (for text/multi-provider chat) -->
+        <button
+          id="textDockToggle"
+          type="button"
+          aria-label="Toggle text prompt input"
+          title="Send text prompt (for OpenRouter, Ollama, or Gemini text models)"
+          @click=${() => {
+            this.textInputOpen = !this.textInputOpen;
+          }}
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            height="20px"
+            viewBox="0 -960 960 960"
+            width="20px"
+            fill="currentColor"
+          >
+            <path
+              d="M240-400h320v-80H240v80Zm0-120h480v-80H240v80Zm0-120h480v-80H240v80ZM80-80v-720q0-33 23.5-56.5T160-880h640q33 0 56.5 23.5T880-800v480q0 33-23.5 56.5T800-240H240L80-80Z"
+            />
+          </svg>
+        </button>
       </div>
+
+      ${this.textInputOpen || this.lastTranscriptPreview
+        ? html`
+            <div class="text-dock">
+              ${this.lastTranscriptPreview
+                ? html`<div class="reply-caption">${this.lastTranscriptPreview}</div>`
+                : ''}
+              ${this.textInputOpen
+                ? html`
+                    <form class="text-prompt-form" @submit=${this.handleTextPromptSubmit}>
+                      <input
+                        class="text-prompt-input"
+                        type="text"
+                        placeholder=${this.isLiveAudioMode()
+                          ? 'Select a non-Live model in Settings to chat via text…'
+                          : `Message Vivica (${this.selectedModel})…`}
+                        .value=${this.textPromptDraft}
+                        @input=${(e: Event) => {
+                          this.textPromptDraft = (e.target as HTMLInputElement).value;
+                        }}
+                      />
+                      <button type="submit" class="text-prompt-send">Send</button>
+                    </form>
+                  `
+                : ''}
+            </div>
+          `
+        : ''}
 
       <!-- Settings Flyout Panel -->
       <div
@@ -1239,42 +2307,293 @@ export class GdmLiveAudio extends LitElement {
 
         <form @submit=${this.applySettings}>
           <div class="setting-group">
-            <label class="setting-label" for="apiKey">Gemini API Key</label>
-            <input
-              type="password"
-              class="setting-input"
-              id="apiKey"
-              .value=${this.apiKey}
-              placeholder="Default: Environment API Key"
-            />
+            <label class="setting-label">AI Provider</label>
+            ${(() => {
+              const inspectedProvider: ProviderId =
+                this.selectorFilterScope === 'all'
+                  ? this.selectedProvider
+                  : this.selectorFilterScope;
+              const st = this.providerStatuses.find(
+                (p) => p.id === inspectedProvider,
+              );
+              return html`
+                <div class="provider-pills" role="radiogroup" aria-label="AI Provider">
+                  ${(['google', 'openrouter', 'ollama'] as const).map((pid) => {
+                    const pStatus = this.providerStatuses.find((p) => p.id === pid);
+                    const label =
+                      pid === 'google'
+                        ? 'Google AI'
+                        : pid === 'openrouter'
+                          ? 'OpenRouter'
+                          : 'Ollama';
+                    return html`
+                      <button
+                        type="button"
+                        class="provider-pill ${inspectedProvider === pid ? 'active' : ''}"
+                        @click=${() => {
+                          this.selectorFilterScope = pid;
+                          this.providerTestMessage = '';
+                        }}
+                      >
+                        <span class="mini-dot ${pStatus?.available ? 'ok' : ''}"></span>
+                        <span>${label}</span>
+                      </button>
+                    `;
+                  })}
+                </div>
+
+                <div class="provider-meta-row">
+                  <span>
+                    ${this.providerTestMessage || st?.statusMessage || 'Checking provider…'}
+                  </span>
+                  <button
+                    type="button"
+                    class="btn-inline"
+                    ?disabled=${this.providerTesting}
+                    @click=${() => this.testProviderConnection(inspectedProvider)}
+                  >
+                    ${this.providerTesting ? 'Testing…' : 'Test'}
+                  </button>
+                </div>
+              `;
+            })()}
           </div>
 
-          <div class="setting-group">
-            <label class="setting-label" for="voiceSelect">Assistant Voice</label>
-            <select class="setting-input" id="voiceSelect" .value=${this.selectedVoice}>
-              <option value="Aoede" ?selected=${this.selectedVoice === 'Aoede'}>Aoede (Female - Melodic & Expressive) [Default]</option>
-              <option value="Kore" ?selected=${this.selectedVoice === 'Kore'}>Kore (Female - Gentle & Smooth)</option>
-              <option value="Puck" ?selected=${this.selectedVoice === 'Puck'}>Puck (Engaging & Lively)</option>
-              <option value="Charon" ?selected=${this.selectedVoice === 'Charon'}>Charon (Calm & Reflective)</option>
-              <option value="Fenrir" ?selected=${this.selectedVoice === 'Fenrir'}>Fenrir (Rich & Authoritative)</option>
-              <option value="Orus" ?selected=${this.selectedVoice === 'Orus'}>Orus (Warm & Deep)</option>
-            </select>
-          </div>
+          ${this.selectorFilterScope === 'ollama' || this.selectedProvider === 'ollama'
+            ? html`
+                <div class="setting-group">
+                  <label class="setting-label" for="ollamaHostInput">
+                    Ollama Host URL (Server-validated)
+                  </label>
+                  <div class="inline-row">
+                    <input
+                      class="setting-input"
+                      id="ollamaHostInput"
+                      type="text"
+                      placeholder=${this.defaultOllamaHost}
+                      .value=${this.ollamaHost}
+                      @input=${(e: Event) => {
+                        this.ollamaHost = (e.target as HTMLInputElement).value;
+                      }}
+                    />
+                    <button
+                      type="button"
+                      class="btn-inline"
+                      @click=${() => {
+                        localStorage.setItem('ollama_host', this.ollamaHost.trim());
+                        void this.loadProvidersAndModels(true);
+                      }}
+                    >
+                      Discover
+                    </button>
+                  </div>
+                  <div class="hint-text">
+                    Default: ${this.defaultOllamaHost}. Runs on backend host; loopback/LAN URLs only.
+                  </div>
+                </div>
+              `
+            : ''}
 
           <div class="setting-group">
-            <label class="setting-label" for="modelSelect">Live Audio Model</label>
-            <select class="setting-input" id="modelSelect" .value=${this.selectedModel}>
-              <option
-                value="gemini-2.5-flash-native-audio-preview-09-2025"
-                ?selected=${this.selectedModel === 'gemini-2.5-flash-native-audio-preview-09-2025'}
-              >
-                Gemini 2.5 Flash Native Audio
-              </option>
-              <option value="gemini-2.0-flash-exp" ?selected=${this.selectedModel === 'gemini-2.0-flash-exp'}>
-                Gemini 2.0 Flash Live
-              </option>
-            </select>
+            <label class="setting-label">Model Selection</label>
+            <vivica-model-selector
+              .models=${this.models}
+              .providers=${this.providerStatuses}
+              .selectedModelId=${this.selectedModel}
+              .selectedProviderId=${this.selectedProvider}
+              .filterProvider=${this.selectorFilterScope}
+              .openRouterFreeOnly=${this.openRouterFreeOnly}
+              .loading=${this.catalogLoading}
+              .errorMessage=${this.catalogError}
+              @select-model=${this.handleUnifiedModelSelect}
+              @filter-provider-change=${(e: CustomEvent<{ scope: ProviderId | 'all' }>) => {
+                this.selectorFilterScope = e.detail.scope;
+              }}
+              @toggle-free-only=${(e: CustomEvent<{ freeOnly: boolean }>) => {
+                this.openRouterFreeOnly = e.detail.freeOnly;
+                localStorage.setItem('openrouter_free_only', String(this.openRouterFreeOnly));
+              }}
+              @refresh-models=${() => {
+                void this.loadProvidersAndModels(true);
+              }}
+            ></vivica-model-selector>
           </div>
+
+          ${this.isLiveAudioMode()
+            ? html`
+                <div class="setting-group">
+                  <label class="setting-label" for="voiceSelect">Google Live Voice</label>
+                  <select class="setting-input" id="voiceSelect" .value=${this.selectedVoice}>
+                    <option value="Aoede" ?selected=${this.selectedVoice === 'Aoede'}>
+                      Aoede (Female - Melodic & Expressive) [Default]
+                    </option>
+                    <option value="Kore" ?selected=${this.selectedVoice === 'Kore'}>
+                      Kore (Female - Gentle & Smooth)
+                    </option>
+                    <option value="Puck" ?selected=${this.selectedVoice === 'Puck'}>
+                      Puck (Engaging & Lively)
+                    </option>
+                    <option value="Charon" ?selected=${this.selectedVoice === 'Charon'}>
+                      Charon (Calm & Reflective)
+                    </option>
+                    <option value="Fenrir" ?selected=${this.selectedVoice === 'Fenrir'}>
+                      Fenrir (Rich & Authoritative)
+                    </option>
+                    <option value="Orus" ?selected=${this.selectedVoice === 'Orus'}>
+                      Orus (Warm & Deep)
+                    </option>
+                  </select>
+                </div>
+              `
+            : html`
+                <div class="section-divider">
+                  <div class="provider-meta-row" style="margin-top:0;margin-bottom:8px;">
+                    <span class="setting-label" style="margin:0;">Speech Pipeline (Non-Live Models)</span>
+                    <button
+                      type="button"
+                      class="btn-inline"
+                      ?disabled=${this.audioDiscoveryLoading}
+                      @click=${() => this.loadAudioEngines(true)}
+                    >
+                      ${this.audioDiscoveryLoading ? 'Scanning…' : '↻ Scan Local'}
+                    </button>
+                  </div>
+
+                  <div class="setting-group">
+                    <label class="setting-label" for="sttEngineSelect">Speech-to-Text (STT) Engine</label>
+                    <select
+                      class="setting-input"
+                      id="sttEngineSelect"
+                      .value=${this.selectedSttEngine}
+                      @change=${(e: Event) => {
+                        this.selectedSttEngine = (e.target as HTMLSelectElement).value;
+                        const eng = this.audioDiscovery?.stt.find(
+                          (item) => item.id === this.selectedSttEngine,
+                        );
+                        this.selectedSttModel = eng?.models[0]?.id || '';
+                      }}
+                    >
+                      ${(this.audioDiscovery?.stt || []).map(
+                        (eng: AudioEngineInfo) => html`
+                          <option
+                            value=${eng.id}
+                            ?selected=${this.selectedSttEngine === eng.id}
+                          >
+                            ${eng.name} — ${eng.available ? 'Ready' : 'Unavailable'}
+                          </option>
+                        `,
+                      )}
+                      <option value="browser" ?selected=${this.selectedSttEngine === 'browser'}>
+                        Browser Web Speech STT (Fallback)
+                      </option>
+                    </select>
+                    ${(() => {
+                      const eng = this.audioDiscovery?.stt.find(
+                        (item) => item.id === this.selectedSttEngine,
+                      );
+                      if (this.selectedSttEngine === 'browser') {
+                        return html`<div class="hint-text">
+                          Uses browser Web Speech API when no local server STT engine is active.
+                        </div>`;
+                      }
+                      if (!eng) return '';
+                      return html`
+                        <div class="hint-text ${eng.available ? 'ok' : 'warn'}">
+                          ${eng.statusMessage}
+                        </div>
+                        ${eng.models.length > 0
+                          ? html`
+                              <select
+                                class="setting-input"
+                                id="sttModelSelect"
+                                style="margin-top:6px;"
+                                .value=${this.selectedSttModel}
+                              >
+                                ${eng.models.map(
+                                  (m) => html`
+                                    <option
+                                      value=${m.id}
+                                      ?selected=${this.selectedSttModel === m.id}
+                                    >
+                                      ${m.name}
+                                    </option>
+                                  `,
+                                )}
+                              </select>
+                            `
+                          : ''}
+                      `;
+                    })()}
+                  </div>
+
+                  <div class="setting-group">
+                    <label class="setting-label" for="ttsEngineSelect">Text-to-Speech (TTS) Engine</label>
+                    <select
+                      class="setting-input"
+                      id="ttsEngineSelect"
+                      .value=${this.selectedTtsEngine}
+                      @change=${(e: Event) => {
+                        this.selectedTtsEngine = (e.target as HTMLSelectElement).value;
+                        const eng = this.audioDiscovery?.tts.find(
+                          (item) => item.id === this.selectedTtsEngine,
+                        );
+                        this.selectedTtsVoice = eng?.models[0]?.id || '';
+                      }}
+                    >
+                      ${(this.audioDiscovery?.tts || []).map(
+                        (eng: AudioEngineInfo) => html`
+                          <option
+                            value=${eng.id}
+                            ?selected=${this.selectedTtsEngine === eng.id}
+                          >
+                            ${eng.name} — ${eng.available ? 'Ready' : 'Unavailable'}
+                          </option>
+                        `,
+                      )}
+                      <option value="browser" ?selected=${this.selectedTtsEngine === 'browser'}>
+                        Browser SpeechSynthesis (Fallback)
+                      </option>
+                    </select>
+                    ${(() => {
+                      const eng = this.audioDiscovery?.tts.find(
+                        (item) => item.id === this.selectedTtsEngine,
+                      );
+                      if (this.selectedTtsEngine === 'browser') {
+                        return html`<div class="hint-text">
+                          Uses browser SpeechSynthesis API when local Piper/Kokoro is not running.
+                        </div>`;
+                      }
+                      if (!eng) return '';
+                      return html`
+                        <div class="hint-text ${eng.available ? 'ok' : 'warn'}">
+                          ${eng.statusMessage}
+                        </div>
+                        ${eng.models.length > 0
+                          ? html`
+                              <select
+                                class="setting-input"
+                                id="ttsVoiceSelect"
+                                style="margin-top:6px;"
+                                .value=${this.selectedTtsVoice}
+                              >
+                                ${eng.models.map(
+                                  (m) => html`
+                                    <option
+                                      value=${m.id}
+                                      ?selected=${this.selectedTtsVoice === m.id}
+                                    >
+                                      ${m.name}
+                                    </option>
+                                  `,
+                                )}
+                              </select>
+                            `
+                          : ''}
+                      `;
+                    })()}
+                  </div>
+                </div>
+              `}
 
           <div class="setting-group">
             <label class="setting-label" for="visualModeSelect">Orb Visual Style</label>
@@ -1299,7 +2618,7 @@ export class GdmLiveAudio extends LitElement {
             ></textarea>
           </div>
 
-          <button type="submit" class="btn-apply">Save & Reconnect</button>
+          <button type="submit" class="btn-apply">Save & Apply</button>
         </form>
       </div>
     `;
